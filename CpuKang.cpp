@@ -175,6 +175,27 @@ void RCCpuKang::FlushDPBuffer()
 	}
 }
 
+void RCCpuKang::InitializeWildKangaroo(int kang_idx)
+{
+	// Reseed a single kangaroo as WILD1 (for JLP-style execution)
+	// Used after finding a DP to get a fresh kangaroo
+	Kangaroos[kang_idx].type = WILD1;
+	Kangaroos[kang_idx].point = PntA;  // Start from PubKey + HalfRange
+	Kangaroos[kang_idx].dist.SetZero();
+
+	// Do random jumps to scatter starting position
+	int num_jumps = 50 + (kang_idx % 100);  // 50-150 jumps
+	for (int j = 0; j < num_jumps; j++)
+	{
+		u32 jmp_idx = (u32)(Kangaroos[kang_idx].point.x.data[0]) % JMP_CNT;
+		Kangaroos[kang_idx].point = ec.AddPoints(Kangaroos[kang_idx].point, EcJumps1[jmp_idx].p);
+		Kangaroos[kang_idx].dist.Add(EcJumps1[jmp_idx].dist);
+#if USE_GR_EQUIVALENCE
+		NormalizePoint_GR(&Kangaroos[kang_idx].point);
+#endif
+	}
+}
+
 void RCCpuKang::ProcessKangaroo(int kang_idx)
 {
 	TCpuKang* kang = &Kangaroos[kang_idx];
@@ -311,6 +332,138 @@ void RCCpuKang::Execute()
 		{
 			u64 ops_delta = TotalOps - ops_at_last_stats;
 			int speed_kkeys = (int)(ops_delta / 1000); // KKeys/s (CPU does fewer ops than GPU)
+
+			SpeedStats[cur_stats_ind] = speed_kkeys;
+			cur_stats_ind = (cur_stats_ind + 1) % CPU_STATS_WND_SIZE;
+
+			last_stats_time = now;
+			ops_at_last_stats = TotalOps;
+
+			// Flush any pending DPs
+			FlushDPBuffer();
+		}
+	}
+
+	// Final flush
+	FlushDPBuffer();
+}
+
+// Optimized execution with larger batches while maintaining cache locality
+void RCCpuKang::Execute_Optimized()
+{
+	u64 last_stats_time = GetTickCount64();
+	u64 ops_at_last_stats = 0;
+
+	while (!StopFlag && !gSolved)
+	{
+		// Process all kangaroos in sequence (preserves cache locality)
+		for (int kang_idx = 0; kang_idx < KangCnt && !StopFlag && !gSolved; kang_idx++)
+		{
+			TCpuKang* kang = &Kangaroos[kang_idx];
+
+			// Larger batch size (5000 steps) - balanced between overhead reduction and cache locality
+			const int BATCH_SIZE = 5000;
+
+			for (int step = 0; step < BATCH_SIZE && !StopFlag && !gSolved; step++)
+			{
+				// Select jump based on x-coordinate
+				u32 jmp_idx = (u32)(kang->point.x.data[0]) & JMP_MASK;
+				EcJMP* jump = &EcJumps1[jmp_idx];
+
+				// EC point addition
+				kang->point = ec.AddPoints(kang->point, jump->p);
+				kang->dist.Add(jump->dist);
+
+				TotalOps++;
+			}
+
+			// Check if this is a distinguished point (after batch)
+			if (IsDistinguishedPoint(kang->point.x))
+			{
+				// Format: 12 bytes X + 4 bytes padding + 22 bytes dist + 2 bytes type + 2 bytes padding
+				u8* dp_rec = (u8*)&DPBuffer[DPBufferIndex * (GPU_DP_SIZE / 4)];
+
+				// Copy x-coordinate (first 12 bytes)
+				memcpy(dp_rec, &kang->point.x.data[0], 12);
+
+				// Padding (4 bytes)
+				memset(dp_rec + 12, 0, 4);
+
+				// Copy distance (22 bytes)
+				memcpy(dp_rec + 16, &kang->dist.data[0], 22);
+
+				// Copy type
+				dp_rec[38] = 0;
+				dp_rec[39] = 0;
+				dp_rec[40] = kang->type;
+				dp_rec[41] = 0;
+
+				// Padding
+				memset(dp_rec + 42, 0, 6);
+
+				DPBufferIndex++;
+
+				// Restart this kangaroo with new random position
+				if (kang->type == TAME)
+				{
+					kang->point = g_G;
+					kang->dist.SetZero();
+					int num_jumps = 50 + (kang_idx % 100);
+					for (int j = 0; j < num_jumps; j++)
+					{
+						u32 jmp_idx = (u32)(kang->point.x.data[0]) % JMP_CNT;
+						kang->point = ec.AddPoints(kang->point, EcJumps1[jmp_idx].p);
+						kang->dist.Add(EcJumps1[jmp_idx].dist);
+#if USE_GR_EQUIVALENCE
+						NormalizePoint_GR(&kang->point);
+#endif
+					}
+				}
+				else if (kang->type == WILD1)
+				{
+					kang->point = PntA;
+					kang->dist.SetZero();
+					int num_jumps = 50 + (kang_idx % 100);
+					for (int j = 0; j < num_jumps; j++)
+					{
+						u32 jmp_idx = (u32)(kang->point.x.data[0]) % JMP_CNT;
+						kang->point = ec.AddPoints(kang->point, EcJumps1[jmp_idx].p);
+						kang->dist.Add(EcJumps1[jmp_idx].dist);
+#if USE_GR_EQUIVALENCE
+						NormalizePoint_GR(&kang->point);
+#endif
+					}
+				}
+				else
+				{
+					kang->point = PntB;
+					kang->dist.SetZero();
+					int num_jumps = 50 + (kang_idx % 100);
+					for (int j = 0; j < num_jumps; j++)
+					{
+						u32 jmp_idx = (u32)(kang->point.x.data[0]) % JMP_CNT;
+						kang->point = ec.AddPoints(kang->point, EcJumps1[jmp_idx].p);
+						kang->dist.Add(EcJumps1[jmp_idx].dist);
+#if USE_GR_EQUIVALENCE
+						NormalizePoint_GR(&kang->point);
+#endif
+					}
+				}
+			}
+
+			// Flush buffer if full
+			if (DPBufferIndex >= 256)
+			{
+				FlushDPBuffer();
+			}
+		}
+
+		// Update statistics every second
+		u64 now = GetTickCount64();
+		if (now - last_stats_time >= 1000)
+		{
+			u64 ops_delta = TotalOps - ops_at_last_stats;
+			int speed_kkeys = (int)(ops_delta / 1000);
 
 			SpeedStats[cur_stats_ind] = speed_kkeys;
 			cur_stats_ind = (cur_stats_ind + 1) % CPU_STATS_WND_SIZE;

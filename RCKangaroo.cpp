@@ -47,6 +47,8 @@ EcInt gPrivKey;
 volatile u64 TotalOps;
 u32 TotalSolved;
 u32 gTotalErrors;
+volatile u64 DroppedDPs = 0;
+volatile u64 TotalDPsGenerated = 0;
 u64 PntTotalOps;
 bool IsBench;
 
@@ -63,13 +65,15 @@ int gTameBitsOffset = 4; // SOTA+ tame bits offset
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
-bool gUseHerds = false; // SOTA++ Herds mode (for puzzles 100+ bits)
 
 // Save/Resume work file support
 RCWorkFile* g_work_file = nullptr;
 AutoSaveManager* g_autosave = nullptr;
 std::string g_work_filename;
 uint64_t g_autosave_interval = 60;  // Default: 60 seconds
+
+// SOTA++ Herds mode
+bool g_use_herds = false;
 time_t g_start_time = 0;
 bool g_resume_mode = false;
 
@@ -146,6 +150,7 @@ u32 __stdcall kang_thr_proc(void* data)
 u32 __stdcall cpu_kang_thr_proc(void* data)
 {
 	RCCpuKang* Kang = (RCCpuKang*)data;
+	// Use original RC implementation (best performance for this codebase)
 	Kang->Execute();
 	InterlockedDecrement(&ThrCnt);
 	return 0;
@@ -161,7 +166,8 @@ void* kang_thr_proc(void* data)
 void* cpu_kang_thr_proc(void* data)
 {
 	RCCpuKang* Kang = (RCCpuKang*)data;
-	Kang->Execute();
+	// Use optimized version: larger batches (5K) while preserving cache locality
+	Kang->Execute_Optimized();
 	__sync_fetch_and_sub(&ThrCnt, 1);
 	return 0;
 }
@@ -169,16 +175,29 @@ void* cpu_kang_thr_proc(void* data)
 void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
 {
 	csAddPoints.Enter();
-
-	// Always count operations, even if buffer overflows
+	
 	PntTotalOps += ops_cnt;
-
+	TotalDPsGenerated += pnt_cnt;
+	
 	if (PntIndex + pnt_cnt >= MAX_CNT_LIST)
 	{
+		DroppedDPs += pnt_cnt;
+		
+		static u64 last_warning = 0;
+		if (DroppedDPs - last_warning >= 10000)
+		{
+			printf("\n⚠️  WARNING: DP BUFFER OVERFLOW!\n");
+			printf("    Dropped: %llu DPs (%.1f%% loss)\n",
+			       (unsigned long long)DroppedDPs,
+			       100.0 * DroppedDPs / TotalDPsGenerated);
+			printf("    FIX: Use -dp %d (current: %d)\n\n", gDP + 2, gDP);
+			last_warning = DroppedDPs;
+		}
+		
 		csAddPoints.Leave();
-		// Buffer full - silently drop DPs but operations are still counted
 		return;
 	}
+	
 	memcpy(pPntList + GPU_DP_SIZE * PntIndex, data, pnt_cnt * GPU_DP_SIZE);
 	PntIndex += pnt_cnt;
 	csAddPoints.Leave();
@@ -337,12 +356,20 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	if (elapsed_ms == 0) elapsed_ms = 1; // Avoid division by zero
 
 	// Real speed = total ops / elapsed seconds / 1 million (for MKeys/s)
-	int speed = (int)(PntTotalOps / (elapsed_ms / 1000.0) / 1000000.0);
+	int total_speed = (int)(PntTotalOps / (elapsed_ms / 1000.0) / 1000000.0);
+
+	// Get CPU speed breakdown from GPU monitor
+	int cpu_speed = 0;
+	if (g_gpu_monitor) {
+		SystemStats sys_stats = g_gpu_monitor->GetSystemStats();
+		cpu_speed = (int)sys_stats.cpu_speed_mkeys;
+	}
+	int gpu_speed = total_speed - cpu_speed;
 
 	u64 est_dps_cnt = (u64)(exp_ops / dp_val);
 	u64 exp_sec_total = 0xFFFFFFFFFFFFFFFFull;
-	if (speed)
-		exp_sec_total = (u64)((exp_ops / 1000000) / speed); //in sec
+	if (total_speed)
+		exp_sec_total = (u64)((exp_ops / 1000000) / total_speed); //in sec
 	u64 exp_days = exp_sec_total / (3600 * 24);
 	int exp_hours = (int)(exp_sec_total - exp_days * (3600 * 24)) / 3600;
 	int exp_min = (int)(exp_sec_total - exp_days * (3600 * 24) - exp_hours * 3600) / 60;
@@ -354,7 +381,12 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	int min = (int)(sec_total - days * (3600 * 24) - hours * 3600) / 60;
 	int sec = (int)(sec_total - days * (3600 * 24) - hours * 3600 - min * 60);
 
-	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm:%02ds/%llud:%02dh:%02dm:%02ds\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, sec, exp_days, exp_hours, exp_min, exp_sec);
+	// Show total speed with GPU+CPU breakdown
+	printf("%sSpeed: %d MKeys/s (%d GPU + %d CPU), Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm:%02ds/%llud:%02dh:%02dm:%02ds\r\n",
+		gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "),
+		total_speed, gpu_speed, cpu_speed,
+		gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000,
+		days, hours, min, sec, exp_days, exp_hours, exp_min, exp_sec);
 }
 
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
@@ -502,8 +534,16 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 //prepare GPUs
 	for (int i = 0; i < GpuCnt; i++)
 	{
-		// Enable SOTA++ herds if requested and range is suitable
-		GpuKangs[i]->SetUseHerds(gUseHerds, Range);
+		// Enable SOTA++ herds if requested and range is large enough
+		if (g_use_herds && Range >= 100)
+		{
+			printf("[GPU %d] Enabling SOTA++ herds (range=%d bits)\r\n", GpuKangs[i]->CudaIndex, Range);
+			GpuKangs[i]->SetUseHerds(true, Range);
+		}
+		else if (g_use_herds && Range < 100)
+		{
+			printf("[GPU %d] Herds disabled: range too small (%d < 100)\r\n", GpuKangs[i]->CudaIndex, Range);
+		}
 
 		if (!GpuKangs[i]->Prepare(PntToSolve, Range, DP, EcJumps1, EcJumps2, EcJumps3))
 		{
@@ -573,7 +613,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	while (!gSolved)
 	{
 		CheckNewPoints();
-		Sleep(10);
+		Sleep(1);
 
 		// GPU monitoring and thermal management (every second)
 		if (g_gpu_monitor && (GetTickCount64() - tm_monitor > 1000))
@@ -648,7 +688,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	for (int i = 0; i < CpuCnt; i++)
 		CpuKangs[i]->Stop();
 	while (ThrCnt)
-		Sleep(10);
+		Sleep(1);
 	for (int i = 0; i < GpuCnt; i++)
 	{
 #ifdef _WIN32
@@ -822,12 +862,6 @@ bool ParseCommandLine(int argc, char* argv[])
 			gCpuThreads = val;
 		}
 		else
-		if (strcmp(argument, "-herds") == 0)
-		{
-			gUseHerds = true;
-			printf("SOTA++ herds mode enabled (automatic for puzzles ≥100 bits)\r\n");
-		}
-		else
 		if (strcmp(argument, "-workfile") == 0)
 		{
 			if (ci >= argc)
@@ -856,6 +890,12 @@ bool ParseCommandLine(int argc, char* argv[])
 			}
 			g_autosave_interval = val;
 			printf("Auto-save interval: %llu seconds\r\n", (unsigned long long)g_autosave_interval);
+		}
+		else
+		if (strcmp(argument, "-herds") == 0)
+		{
+			g_use_herds = true;
+			printf("SOTA++ herds mode enabled\r\n");
 		}
 		else
 		if (strcmp(argument, "-info") == 0)
@@ -959,9 +999,9 @@ int main(int argc, char* argv[])
 #endif
 
 	printf("********************************************************************************\r\n");
-	printf("*        RCKangaroo v3.2 Hybrid+SOTA+  (c) 2024 RetiredCoder + fmg75          *\r\n");
-	printf("*        GPU+CPU Hybrid with SOTA+ Optimizations (+10-30%% performance)       *\r\n");
-	printf("*        Nataanii's Optimized Fork - SOTA+ Bug Fix & Enhancements             *\r\n");
+	printf("*        RCKangaroo v3.2 Hybrid+SOTA+  (c) 2024 RetiredCoder + fmg75           *\r\n");
+	printf("*        GPU+CPU Hybrid with SOTA+ Optimizations (+10-30%% performance)        *\r\n");
+	printf("*        Nataanii's Optimized Fork - SOTA++ Herds Save Functions               *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
 	printf("This software is free and open-source: https://github.com/RetiredC\r\n");
@@ -1211,4 +1251,6 @@ label_end:
 	free(pPntList2);
 	free(pPntList);
 }
+
+
 

@@ -39,28 +39,28 @@ struct TPointPriv
 class RCGpuKang
 {
 private:
-	bool StopFlag;
+	bool StopFlag = false;  // Initialize to false
 	EcPoint PntToSolve;
-	int Range; //in bits
-	int DP_bits; //in bits (renamed from DP to avoid conflict with DP struct)
+	int Range = 0;  // Initialize to 0
+	int DP_bits = 0;  // Initialize to 0
 	Ec ec;
 
-	u32* DPs_out;
-	TKparams Kparams;
+	u32* DPs_out = nullptr;  // Initialize to nullptr
+	TKparams Kparams{}; // Zero-initialize struct
 
 	EcInt HalfRange;
 	EcPoint PntHalfRange;
 	EcPoint NegPntHalfRange;
-	TPointPriv* RndPnts;
-	EcJMP* EcJumps1;
-	EcJMP* EcJumps2;
-	EcJMP* EcJumps3;
+	TPointPriv* RndPnts = nullptr;
+	EcJMP* EcJumps1 = nullptr;
+	EcJMP* EcJumps2 = nullptr;
+	EcJMP* EcJumps3 = nullptr;
 
 	EcPoint PntA;
 	EcPoint PntB;
 
-	int cur_stats_ind;
-	int SpeedStats[STATS_WND_SIZE];
+	int cur_stats_ind = 0;
+	int SpeedStats[STATS_WND_SIZE] = {};  // Zero-initialize array
 
 	void GenerateRndDistances();
 	bool Start();
@@ -69,22 +69,22 @@ private:
 	int Dbg_CheckKangs();
 #endif
 	// SOTA++ Herd support
-	bool use_herds_;
-	GpuHerdManager* herd_manager_;
+	bool use_herds_ = false;  // CRITICAL: Initialize to false!
+	GpuHerdManager* herd_manager_ = nullptr;  // CRITICAL: Initialize to nullptr!
 
 	// Herd mode GPU arrays (separate X/Y/Dist format)
-	u64* d_herd_kangaroo_x_;
-	u64* d_herd_kangaroo_y_;
-	u64* d_herd_kangaroo_dist_;
-	DP* h_herd_dp_buffer_;  // Host buffer for DP collection
+	u64* d_herd_kangaroo_x_ = nullptr;
+	u64* d_herd_kangaroo_y_ = nullptr;
+	u64* d_herd_kangaroo_dist_ = nullptr;
+	DP* h_herd_dp_buffer_ = nullptr;  // Host buffer for DP collection
 
 public:
-	int persistingL2CacheMaxSize;
-	int CudaIndex; //gpu index in cuda
-	int mpCnt;
-	int KangCnt;
-	bool Failed;
-	bool IsOldGpu;
+	int persistingL2CacheMaxSize = 0;
+	int CudaIndex = 0;  // GPU index in cuda
+	int mpCnt = 0;
+	int KangCnt = 0;
+	bool Failed = false;
+	bool IsOldGpu = false;
 
 	int CalcKangCnt();
 	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);

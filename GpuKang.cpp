@@ -53,12 +53,8 @@ void RCGpuKang::SetUseHerds(bool enable, int range_bits)
         }
     }
 
-    // Initialize all herd pointers to nullptr
-    herd_manager_ = nullptr;
-    d_herd_kangaroo_x_ = nullptr;
-    d_herd_kangaroo_y_ = nullptr;
-    d_herd_kangaroo_dist_ = nullptr;
-    h_herd_dp_buffer_ = nullptr;
+    // Note: Herd pointers are initialized to nullptr in class member initializers
+    // They will be allocated in Prepare() if use_herds_ is true
 }
 
 int RCGpuKang::CalcKangCnt()
@@ -637,8 +633,71 @@ void RCGpuKang::Execute()
 		u64 pnt_cnt = (u64)KangCnt * STEP_CNT;
 
 		// ========================================================================
-		// Use optimized unified kernel (with herd support integrated)
+		// Choose kernel implementation
 		// ========================================================================
+#if USE_SEPARATE_HERD_KERNEL
+		// Use separate herd kernel (experimental - for benchmarking)
+		if (use_herds_ && herd_manager_) {
+			// Launch separate herd kernel
+			launchHerdKernels(
+				herd_manager_->GetMemory(),
+				d_herd_jump_table_,
+				d_herd_kangaroo_x_,
+				d_herd_kangaroo_y_,
+				d_herd_kangaroo_dist_,
+				STEP_CNT,  // iterations
+				Kparams.DP_rshift
+			);
+
+			// Check for kernel launch errors
+			err = cudaGetLastError();
+			if (err != cudaSuccess) {
+				printf("GPU %d, launchHerdKernels failed: %s\r\n", CudaIndex, cudaGetErrorString(err));
+				gTotalErrors++;
+				break;
+			}
+
+			// Collect DPs from herd kernel
+			DP* h_dp_buffer = (DP*)malloc(herd_manager_->GetMemory()->config.gpu_dp_buffer_size * sizeof(DP));
+			cnt = checkHerdCollisions(herd_manager_->GetMemory(), h_dp_buffer, herd_manager_->GetMemory()->config.gpu_dp_buffer_size);
+
+			if (cnt > 0) {
+				// Convert DP format and add to list
+				// TODO: Implement DP conversion from herd format to unified format
+				printf("[GPU %d] Herd kernel found %d DPs (conversion not implemented)\n", CudaIndex, cnt);
+			}
+
+			free(h_dp_buffer);
+		} else {
+			// Fall back to unified kernel
+			cudaMemset(Kparams.DPs_out, 0, 4);
+			cudaMemset(Kparams.DPTable, 0, KangCnt * sizeof(u32));
+			cudaMemset(Kparams.LoopedKangs, 0, 8);
+			CallGpuKernelABC(Kparams);
+
+			err = cudaMemcpy(&cnt, Kparams.DPs_out, 4, cudaMemcpyDeviceToHost);
+			if (err != cudaSuccess) {
+				printf("GPU %d, CallGpuKernel failed: %s\r\n", CudaIndex, cudaGetErrorString(err));
+				gTotalErrors++;
+				break;
+			}
+
+			if (cnt >= MAX_DP_CNT) {
+				cnt = MAX_DP_CNT;
+				printf("GPU %d, gpu DP buffer overflow, some points lost, increase DP value!\r\n", CudaIndex);
+			}
+
+			if (cnt) {
+				err = cudaMemcpy(DPs_out, Kparams.DPs_out + 4, cnt * GPU_DP_SIZE, cudaMemcpyDeviceToHost);
+				if (err != cudaSuccess) {
+					gTotalErrors++;
+					break;
+				}
+				AddPointsToList(DPs_out, cnt, pnt_cnt);
+			}
+		}
+#else
+		// Use optimized unified kernel (with herd support integrated) - RECOMMENDED
 		{
 			cudaMemset(Kparams.DPs_out, 0, 4);
 			cudaMemset(Kparams.DPTable, 0, KangCnt * sizeof(u32));
@@ -670,6 +729,7 @@ void RCGpuKang::Execute()
 				AddPointsToList(DPs_out, cnt, pnt_cnt);
 			}
 		}
+#endif
 
 		//dbg
 		cudaMemcpy(dbg, Kparams.dbg_buf, 1024, cudaMemcpyDeviceToHost);

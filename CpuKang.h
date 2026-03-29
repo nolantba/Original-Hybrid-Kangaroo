@@ -16,7 +16,7 @@
 #define CPU_KANGS_PER_THREAD	1024
 
 // EXPERIMENTAL: Enable Lissajous jump patterns (default: OFF for testing)
-#define USE_LISSAJOUS_CPU 1
+#define USE_LISSAJOUS_CPU 0
 
 // EXPERIMENTAL: Enable Galbraith-Ruprai equivalence (DISABLED - breaks GPU collision detection)
 #define USE_GR_EQUIVALENCE 0
@@ -63,6 +63,7 @@ private:
 	int DPBufferIndex;
 
 	void InitializeKangaroos();
+	void InitializeWildKangaroo(int kang_idx);  // For reseeding after DP found
 	void ProcessKangaroo(int kang_idx);
 	bool IsDistinguishedPoint(EcInt& x);
 	void FlushDPBuffer();
@@ -76,6 +77,9 @@ public:
 
 	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);
 	void Stop();
-	void Execute();
+	void Execute();  // Original RC implementation
+	void Execute_Optimized();  // Optimized with larger batches + cache locality
+	void Execute_JLP();  // JLP-inspired optimized version
+	void Execute_JLP_Extreme();  // Ultra-aggressive JLP version
 	int GetStatsSpeed();
 };

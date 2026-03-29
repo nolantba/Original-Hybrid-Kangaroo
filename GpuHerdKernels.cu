@@ -3,7 +3,7 @@
 #include "RCGpuUtils.h"
 #include "defs.h"  // For JMP_CNT, TAME, WILD1, WILD2
 #include <cuda_runtime.h>
-#include <cstdio>
+// Note: Removed stdio - not needed for device code
 
 // ============================================================================
 // OPTIMIZED Herd Kernel with Montgomery Batch Inversion
